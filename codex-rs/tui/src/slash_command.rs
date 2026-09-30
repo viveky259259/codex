@@ -138,7 +138,7 @@ impl SlashCommand {
             SlashCommand::Agents => "open the agent command center",
             SlashCommand::MultiAgents => "switch between this session's subagents",
             SlashCommand::Side | SlashCommand::Btw => {
-                "start a side conversation in an ephemeral fork"
+                "start a side conversation (archived when closed)"
             }
             SlashCommand::Permissions => "choose what Codex is allowed to do",
             SlashCommand::Keymap => "remap TUI shortcuts",

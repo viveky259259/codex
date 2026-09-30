@@ -920,15 +920,24 @@ See the Codex keymap documentation for supported actions and examples."
             if read_only_thread {
                 app.chat_widget.show_external_writer_thread();
             }
-            match startup_draft
-                .run_until(
-                    tui,
-                    app.enqueue_primary_thread_session(started.session, started.turns),
-                )
-                .await
-            {
-                Ok(result) => result?,
-                Err(err) => return shutdown_on_startup_error(app_server, err).await,
+            if started.side_parent_thread_id.is_some() {
+                if let Err(error) = app
+                    .attach_resumed_thread(tui, &mut app_server, started)
+                    .await
+                {
+                    return shutdown_on_startup_error(app_server, error).await;
+                }
+            } else {
+                match startup_draft
+                    .run_until(
+                        tui,
+                        app.enqueue_primary_thread_session(started.session, started.turns),
+                    )
+                    .await
+                {
+                    Ok(result) => result?,
+                    Err(err) => return shutdown_on_startup_error(app_server, err).await,
+                }
             }
             if read_only_thread {
                 app.ensure_thread_channel(thread_id).mark_external_writer();
