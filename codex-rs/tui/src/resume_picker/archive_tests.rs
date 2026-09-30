@@ -57,6 +57,7 @@ fn set_selected_session(state: &mut PickerState, thread_id: ThreadId) {
         updated_at: None,
         cwd: None,
         git_branch: None,
+        is_side_conversation: false,
     }];
     state.apply_filter();
 }
@@ -213,7 +214,7 @@ fn archived_status_preserves_directory_filter_and_hides_archive_shortcut() {
     ");
     insta::assert_snapshot!(
         super::super::toolbar_line(&state, /*compact*/ true).to_string(),
-        @"Filter: Cwd   Archived  Sort: Updated "
+        @"Filter: Cwd   Archived  Side chats: Hidden  Sort: Updated "
     );
 
     state.toggle_filter_mode();

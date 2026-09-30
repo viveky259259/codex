@@ -1,0 +1,12 @@
+---
+source: tui/src/resume_picker.rs
+expression: "snapshots.join(\"\\n\\n\")"
+---
+Comfortable
+Filter: All    Status:  Active  Archived    Side chats:  Shown    Sort:  Updated  Created 
+› Side chat · side chat
+  1d ago        ⌁ no cwd                          no branch
+
+Dense
+Filter: All    Status:  Active  Archived    Side chats:  Shown    Sort:  Updated  Created 
+› 1d ago      Side chat · side chat

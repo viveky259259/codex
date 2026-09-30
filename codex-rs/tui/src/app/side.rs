@@ -1,22 +1,22 @@
-//! Transient side-conversation threads.
+//! Side-conversation threads.
 //!
-//! A side conversation is an ephemeral fork used for a quick /side question while keeping the
-//! primary thread focused. This module owns the app-level lifecycle for those forks: switching into
-//! them, returning to their parent, and discarding them when normal thread navigation moves
-//! elsewhere. The fork receives hidden developer instructions that make inherited history reference
+//! A side conversation is a saved fork used for a quick /side question while keeping the primary
+//! thread focused. This module owns the app-level lifecycle for those forks: switching into them,
+//! returning to their parent, and archiving them when normal thread navigation moves elsewhere. The
+//! fork receives hidden developer instructions that make inherited history reference
 //! material only and steer the agent away from mutations unless the side conversation explicitly asks
 //! for them.
 
 use super::*;
 use crate::chatwidget::InterruptedTurnNoticeMode;
-use codex_app_server_protocol::ThreadUnsubscribeParams;
-use codex_app_server_protocol::ThreadUnsubscribeResponse;
+use codex_app_server_protocol::ThreadArchiveParams;
+use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::TurnInterruptParams;
 use codex_app_server_protocol::TurnInterruptResponse;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 
-const SIDE_RENAME_BLOCK_MESSAGE: &str = "Side conversations are ephemeral and cannot be renamed.";
+const SIDE_RENAME_BLOCK_MESSAGE: &str = "Side conversations cannot be renamed.";
 const SIDE_MAIN_THREAD_UNAVAILABLE_MESSAGE: &str =
     "'/side' is unavailable until the main thread is ready.";
 const SIDE_NO_STARTED_CONVERSATION_MESSAGE: &str = concat!(
@@ -428,9 +428,9 @@ impl App {
             self.add_agents_overview_error(message);
             return false;
         }
-        if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
+        if let Err(err) = app_server.thread_archive(thread_id).await {
             let message =
-                format!("Failed to close side conversation {thread_id}; it is still open: {err}");
+                format!("Failed to archive side conversation {thread_id}; it is still open: {err}");
             tracing::warn!("{message}");
             self.add_agents_overview_error(message);
             return false;
@@ -455,7 +455,8 @@ impl App {
         let request_handle = app_server.request_handle();
         let interrupt_request_id = app_server.next_request_id();
         let retry_interrupt_request_id = app_server.next_request_id();
-        let unsubscribe_request_id = app_server.next_request_id();
+        let archive_request_id = app_server.next_request_id();
+        let app_event_tx = self.app_event_tx.clone();
 
         self.discard_thread_local_state(thread_id).await;
 
@@ -488,15 +489,20 @@ impl App {
                 tracing::warn!(%error, "failed to interrupt side conversation");
             }
             if let Err(error) = request_handle
-                .request_typed::<ThreadUnsubscribeResponse>(ClientRequest::ThreadUnsubscribe {
-                    request_id: unsubscribe_request_id,
-                    params: ThreadUnsubscribeParams {
+                .request_typed::<ThreadArchiveResponse>(ClientRequest::ThreadArchive {
+                    request_id: archive_request_id,
+                    params: ThreadArchiveParams {
                         thread_id: thread_id.to_string(),
                     },
                 })
                 .await
             {
-                tracing::warn!(%error, "failed to unsubscribe side conversation");
+                tracing::warn!(%error, "failed to archive side conversation");
+                app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                    history_cell::new_error_event(format!(
+                        "Failed to archive side conversation {thread_id}: {error}. It is saved in active sessions; use /resume to reopen it."
+                    )),
+                )));
             }
         });
     }
@@ -614,7 +620,7 @@ impl App {
         }
         fork_config.model_reasoning_effort = self.chat_widget.current_reasoning_effort();
         fork_config.service_tier = self.chat_widget.configured_service_tier();
-        fork_config.ephemeral = true;
+        fork_config.ephemeral = false;
         fork_config.developer_instructions = Some(Self::side_developer_instructions(
             fork_config.developer_instructions.as_deref(),
         ));

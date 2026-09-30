@@ -44,6 +44,7 @@ use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadListCwdFilter;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadSortKey;
+use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadUnarchiveParams;
 use codex_app_server_protocol::ThreadUnarchiveResponse;
 use codex_config::types::SessionPickerViewMode;
@@ -235,23 +236,37 @@ enum SessionStatus {
 enum ToolbarControl {
     Filter,
     Status,
+    SideChats,
     Sort,
 }
 
 impl ToolbarControl {
-    fn previous(self, action: SessionPickerAction) -> Self {
+    fn previous(self, action: SessionPickerAction, status: SessionStatus) -> Self {
         match self {
             Self::Filter => Self::Sort,
             Self::Status => Self::Filter,
+            Self::SideChats => Self::Status,
+            Self::Sort
+                if matches!(action, SessionPickerAction::Resume)
+                    && status == SessionStatus::Archived =>
+            {
+                Self::SideChats
+            }
             Self::Sort if matches!(action, SessionPickerAction::Resume) => Self::Status,
             Self::Sort => Self::Filter,
         }
     }
 
-    fn next(self, action: SessionPickerAction) -> Self {
+    fn next(self, action: SessionPickerAction, status: SessionStatus) -> Self {
         match self {
             Self::Filter if matches!(action, SessionPickerAction::Resume) => Self::Status,
-            Self::Filter | Self::Status => Self::Sort,
+            Self::Status
+                if matches!(action, SessionPickerAction::Resume)
+                    && status == SessionStatus::Archived =>
+            {
+                Self::SideChats
+            }
+            Self::Filter | Self::Status | Self::SideChats => Self::Sort,
             Self::Sort => Self::Filter,
         }
     }
@@ -364,7 +379,7 @@ struct SessionPickerRunOptions {
 ///
 /// Filtering happens in two layers:
 /// 1. Provider, source, and eligible working-directory filtering at the backend.
-/// 2. Typed search filtering over loaded rows in the picker.
+/// 2. Typed search and archived side-conversation filtering over loaded rows in the picker.
 pub async fn run_resume_picker_with_app_server(
     uses_remote_filesystem: bool,
     tui: &mut Tui,
@@ -858,6 +873,7 @@ struct PickerState {
     provider_filter: ProviderFilter,
     filter_mode: SessionFilterMode,
     status: SessionStatus,
+    show_side_conversations: bool,
     filter_cwd: Option<PathBuf>,
     local_filter_cwd: Option<PathBuf>,
     worktrees_enabled: bool,
@@ -970,6 +986,7 @@ struct Row {
     updated_at: Option<DateTime<Utc>>,
     cwd: Option<PathBuf>,
     git_branch: Option<String>,
+    is_side_conversation: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -988,6 +1005,14 @@ impl Row {
 
     fn display_preview(&self) -> &str {
         self.thread_name.as_deref().unwrap_or(&self.preview)
+    }
+
+    fn display_title(&self) -> std::borrow::Cow<'_, str> {
+        if self.is_side_conversation {
+            format!("Side chat · {}", self.display_preview()).into()
+        } else {
+            self.display_preview().into()
+        }
     }
 
     fn matches_query(&self, query: &str) -> bool {
@@ -1057,6 +1082,7 @@ impl PickerState {
             provider_filter,
             filter_mode: SessionFilterMode::from_show_all(show_all, filter_cwd.as_deref()),
             status: SessionStatus::Active,
+            show_side_conversations: false,
             local_filter_cwd: filter_cwd.clone(),
             local_cwd_matches: HashMap::new(),
             worktrees_enabled: false,
@@ -1524,6 +1550,9 @@ impl PickerState {
                 self.complete_pending_page_down();
                 let completed_token = pending.search_token.or(search_token);
                 self.continue_search_if_token_matches(completed_token);
+                if self.status == SessionStatus::Archived && !self.show_side_conversations {
+                    self.maybe_load_more_for_scroll();
+                }
             }
             BackgroundEvent::Preview { thread_id, preview } => {
                 self.transcript_previews.insert(
@@ -1650,14 +1679,18 @@ impl PickerState {
     }
 
     fn row_matches_filter(&self, row: &Row) -> bool {
-        self.filter_mode == SessionFilterMode::All
+        let cwd_matches = self.filter_mode == SessionFilterMode::All
             || self.local_filter_cwd.is_none()
             || row
                 .cwd
                 .as_ref()
                 .and_then(|cwd| self.local_cwd_matches.get(cwd))
                 .copied()
-                .unwrap_or(false)
+                .unwrap_or(false);
+        let side_conversation_matches = self.status != SessionStatus::Archived
+            || self.show_side_conversations
+            || !row.is_side_conversation;
+        cwd_matches && side_conversation_matches
     }
 
     fn row_matches_local_cwd(&self, row: &Row) -> bool {
@@ -1797,7 +1830,9 @@ impl PickerState {
         if self.pagination.is_loading() || self.pagination.next_cursor.is_none() {
             return;
         }
-        if self.filtered_rows.is_empty() {
+        if self.filtered_rows.is_empty()
+            && (self.status != SessionStatus::Archived || self.show_side_conversations)
+        {
             return;
         }
         let remaining = self.filtered_rows.len().saturating_sub(self.selected + 1);
@@ -1878,6 +1913,9 @@ impl PickerState {
             SessionStatus::Active => SessionStatus::Archived,
             SessionStatus::Archived => SessionStatus::Active,
         };
+        if self.status == SessionStatus::Active {
+            self.show_side_conversations = false;
+        }
         self.start_initial_load();
     }
 
@@ -1889,11 +1927,11 @@ impl PickerState {
     }
 
     fn focus_previous_toolbar_control(&mut self) {
-        self.toolbar_focus = self.toolbar_focus.previous(self.action);
+        self.toolbar_focus = self.toolbar_focus.previous(self.action, self.status);
     }
 
     fn focus_next_toolbar_control(&mut self) {
-        self.toolbar_focus = self.toolbar_focus.next(self.action);
+        self.toolbar_focus = self.toolbar_focus.next(self.action, self.status);
     }
 
     fn change_focused_toolbar_value(&mut self) {
@@ -1901,6 +1939,11 @@ impl PickerState {
             ToolbarControl::Sort => self.toggle_sort_key(),
             ToolbarControl::Filter => self.toggle_filter_mode(),
             ToolbarControl::Status => self.toggle_status(),
+            ToolbarControl::SideChats => {
+                self.show_side_conversations = !self.show_side_conversations;
+                self.apply_filter();
+                self.maybe_load_more_for_scroll();
+            }
         }
     }
 
@@ -2039,6 +2082,10 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
         }
     };
     let preview = thread.preview.trim();
+    let is_side_conversation = matches!(
+        thread.thread_source,
+        Some(ThreadSource::Feature(ref source)) if source == "side_conversation"
+    );
     Some(Row {
         path: thread.path,
         preview: if preview.is_empty() {
@@ -2054,6 +2101,7 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
             .map(|dt| dt.with_timezone(&Utc)),
         cwd: Some(thread.cwd.to_path_buf()),
         git_branch: thread.git_info.and_then(|git_info| git_info.branch),
+        is_side_conversation,
     })
 }
 
@@ -2150,6 +2198,7 @@ fn toolbar_for_width(state: &PickerState, width: u16) -> Line<'static> {
     let spans = match state.toolbar_focus {
         ToolbarControl::Filter => filter_control_spans(state, /*compact*/ true),
         ToolbarControl::Sort => sort_control_spans(state, /*compact*/ true),
+        ToolbarControl::SideChats => side_chats_control_spans(state, /*compact*/ true),
         ToolbarControl::Status => vec![
             "Status:".set_style(secondary_text_style()),
             toolbar_value(
@@ -2200,9 +2249,31 @@ fn toolbar_line(state: &PickerState, compact: bool) -> Line<'static> {
             ));
         }
         spans.push(separator.set_style(secondary_text_style()));
+        if state.status == SessionStatus::Archived {
+            spans.extend(side_chats_control_spans(state, compact));
+            spans.push(separator.set_style(secondary_text_style()));
+        }
     }
     spans.extend(sort_control_spans(state, compact));
     spans.into()
+}
+
+fn side_chats_control_spans(state: &PickerState, compact: bool) -> Vec<Span<'static>> {
+    let focused = state.toolbar_focus == ToolbarControl::SideChats;
+    let value = if state.show_side_conversations {
+        "Shown"
+    } else {
+        "Hidden"
+    };
+    let label = if compact {
+        "Side chats:"
+    } else {
+        "Side chats: "
+    };
+    vec![
+        label.set_style(secondary_text_style()),
+        toolbar_value(value, /*active*/ true, focused),
+    ]
 }
 
 fn sort_control_spans(state: &PickerState, compact: bool) -> Vec<Span<'static>> {
@@ -2830,7 +2901,7 @@ fn render_comfortable_session_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let marker = selection_marker(is_selected, is_expanded);
-    let title = truncate_text(row.display_preview(), width.saturating_sub(2) as usize);
+    let title = truncate_text(&row.display_title(), width.saturating_sub(2) as usize);
     let title = session_title_span(title, row.thread_id, state.use_theme_colors, is_selected);
     let title_line = Line::from(vec![marker, title]);
     let mut lines = vec![title_line];
@@ -2933,7 +3004,7 @@ fn render_dense_session_lines(
     let mut lines = vec![dense_summary_line(DenseSummaryInput {
         marker,
         date: &date,
-        title: row.display_preview(),
+        title: &row.display_title(),
         thread_id: row.thread_id,
         use_theme_colors: state.use_theme_colors,
         is_selected,
@@ -3642,6 +3713,7 @@ mod tests {
             updated_at: Some(timestamp),
             cwd: None,
             git_branch: None,
+            is_side_conversation: false,
         }
     }
 
@@ -3722,6 +3794,7 @@ mod tests {
             updated_at: None,
             cwd: None,
             git_branch: None,
+            is_side_conversation: false,
         };
 
         assert_eq!(row.display_preview(), "My session");
@@ -4111,6 +4184,7 @@ mod tests {
             updated_at: None,
             cwd: Some(PathBuf::from("/tmp/codex-session-picker")),
             git_branch: Some(String::from("fcoury/session-picker")),
+            is_side_conversation: false,
         };
 
         assert!(row.matches_query("session-picker"));
@@ -4172,6 +4246,7 @@ mod tests {
             updated_at: parse_timestamp_str("2026-05-02T14:48:19Z"),
             cwd: Some(PathBuf::from("/Users/felipe.coury/code/codex")),
             git_branch: Some(String::from("codex/raw-scrollback-mode")),
+            is_side_conversation: false,
         };
 
         let rendered = render_expanded_session_details(&row, &state, /*width*/ 120)
@@ -4418,6 +4493,7 @@ mod tests {
             updated_at: None,
             cwd: Some(PathBuf::from("/srv/real-project")),
             git_branch: None,
+            is_side_conversation: false,
         };
 
         assert!(state.row_matches_filter(&row));
@@ -4443,9 +4519,101 @@ mod tests {
             updated_at: None,
             cwd: Some(PathBuf::from("/srv/remote-project")),
             git_branch: None,
+            is_side_conversation: false,
         };
 
         assert!(state.row_matches_filter(&row));
+    }
+
+    #[test]
+    fn archived_picker_hides_side_conversations_by_default_and_can_show_them() {
+        let loader = page_only_loader(|_| {});
+        let mut state = PickerState::new(
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.status = SessionStatus::Archived;
+        let mut side_row = make_row("/side.jsonl", "2025-01-01T00:00:00Z", "side chat");
+        side_row.is_side_conversation = true;
+        let regular_row = make_row("/main.jsonl", "2025-01-01T00:00:00Z", "main chat");
+
+        assert!(!state.row_matches_filter(&side_row));
+        assert!(state.row_matches_filter(&regular_row));
+
+        state.toolbar_focus = ToolbarControl::SideChats;
+        state.change_focused_toolbar_value();
+        assert!(state.row_matches_filter(&side_row));
+
+        let mut snapshots = Vec::new();
+        for density in [SessionListDensity::Comfortable, SessionListDensity::Dense] {
+            state.density = density;
+            state.relative_time_reference = parse_timestamp_str("2025-01-02T00:00:00Z");
+            let rows = render_session_lines(
+                &side_row, &state, /*is_selected*/ true, /*is_expanded*/ false,
+                /*is_zebra*/ false, /*width*/ 80,
+            )
+            .into_iter()
+            .map(|line| line.to_string().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+            snapshots.push(format!(
+                "{density:?}\n{}\n{rows}",
+                toolbar_line(&state, false)
+            ));
+        }
+        assert_snapshot!(snapshots.join("\n\n"));
+    }
+
+    #[test]
+    fn archived_toolbar_cycles_through_side_chat_filter_in_both_directions() {
+        let controls = [
+            ToolbarControl::Filter,
+            ToolbarControl::Status,
+            ToolbarControl::SideChats,
+            ToolbarControl::Sort,
+        ];
+        for (index, control) in controls.into_iter().enumerate() {
+            assert_eq!(
+                control.next(SessionPickerAction::Resume, SessionStatus::Archived),
+                controls[(index + 1) % controls.len()]
+            );
+            assert_eq!(
+                control.previous(SessionPickerAction::Resume, SessionStatus::Archived),
+                controls[(index + controls.len() - 1) % controls.len()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn archived_picker_loads_past_a_page_containing_only_hidden_side_chats() {
+        let (mut state, requests) = local_db_first_state();
+        state.status = SessionStatus::Archived;
+        state.start_initial_load();
+        let token = state.next_request_token - 1;
+        let mut side_row = make_row("/side.jsonl", "2025-01-01T00:00:00Z", "side chat");
+        side_row.is_side_conversation = true;
+        state
+            .handle_background_event(BackgroundEvent::Page {
+                request_token: token,
+                search_token: None,
+                page: Ok(page(
+                    vec![side_row],
+                    Some("next"),
+                    /*num_scanned_files*/ 1,
+                    /*reached_scan_cap*/ false,
+                )),
+            })
+            .await
+            .unwrap();
+        assert!(state.filtered_rows.is_empty());
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert!(
+            matches!(&requests.lock().unwrap()[1].cursor, Some(PageCursor::AppServer(cursor)) if cursor == "next")
+        );
     }
 
     #[test]
@@ -4471,6 +4639,7 @@ mod tests {
                 updated_at: Some(now - Duration::seconds(42)),
                 cwd: None,
                 git_branch: None,
+                is_side_conversation: false,
             },
             Row {
                 path: Some(PathBuf::from("/tmp/b.jsonl")),
@@ -4481,6 +4650,7 @@ mod tests {
                 updated_at: Some(now - Duration::minutes(35)),
                 cwd: None,
                 git_branch: None,
+                is_side_conversation: false,
             },
             Row {
                 path: Some(PathBuf::from("/tmp/c.jsonl")),
@@ -4491,6 +4661,7 @@ mod tests {
                 updated_at: Some(now - Duration::hours(2)),
                 cwd: None,
                 git_branch: None,
+                is_side_conversation: false,
             },
         ];
         state.all_rows = rows.clone();
@@ -4916,6 +5087,7 @@ mod tests {
             updated_at: None,
             cwd: None,
             git_branch: None,
+            is_side_conversation: false,
         }];
 
         state
@@ -4954,6 +5126,7 @@ mod tests {
                 updated_at: None,
                 cwd: None,
                 git_branch: None,
+                is_side_conversation: false,
             },
             Row {
                 path: None,
@@ -4964,6 +5137,7 @@ mod tests {
                 updated_at: None,
                 cwd: None,
                 git_branch: None,
+                is_side_conversation: false,
             },
         ];
         state.pending_transcript_open = Some(thread_id);
@@ -5088,6 +5262,7 @@ mod tests {
                 updated_at: None,
                 cwd: None,
                 git_branch: None,
+                is_side_conversation: false,
             },
             Row {
                 path: None,
@@ -5098,6 +5273,7 @@ mod tests {
                 updated_at: None,
                 cwd: None,
                 git_branch: None,
+                is_side_conversation: false,
             },
         ];
         state.update_viewport(/*rows*/ 7, /*width*/ 80);
@@ -5153,6 +5329,7 @@ mod tests {
             updated_at: None,
             cwd: None,
             git_branch: None,
+            is_side_conversation: false,
         }];
 
         state
@@ -5183,6 +5360,7 @@ mod tests {
             updated_at: None,
             cwd: None,
             git_branch: None,
+            is_side_conversation: false,
         }];
 
         state
@@ -5324,6 +5502,7 @@ mod tests {
             updated_at: None,
             cwd: None,
             git_branch: None,
+            is_side_conversation: false,
         }];
         state.transcript_cells.insert(
             thread_id,
@@ -5488,6 +5667,7 @@ session_picker_view = "dense"
             updated_at: None,
             cwd: None,
             git_branch: None,
+            is_side_conversation: false,
         }];
 
         state
@@ -5527,6 +5707,7 @@ session_picker_view = "dense"
             updated_at: None,
             cwd: None,
             git_branch: None,
+            is_side_conversation: false,
         }];
 
         state
@@ -5606,6 +5787,7 @@ session_picker_view = "dense"
                 "/Users/felipe.coury/code/codex.fcoury-session-picker/codex-rs",
             )),
             git_branch: Some(String::from("fcoury/session-picker")),
+            is_side_conversation: false,
         }
     }
 
@@ -5862,6 +6044,7 @@ session_picker_view = "dense"
             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
             cwd: Some(PathBuf::from("/tmp/codex")),
             git_branch: Some(String::from("fcoury/session-picker")),
+            is_side_conversation: false,
         };
         let mut state = PickerState::new(
             FrameRequester::test_dummy(),
@@ -5934,6 +6117,7 @@ session_picker_view = "dense"
             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
             cwd: Some(PathBuf::from("/tmp/codex")),
             git_branch: Some(String::from("fcoury/session-picker")),
+            is_side_conversation: false,
         };
         let mut state = PickerState::new(
             FrameRequester::test_dummy(),
@@ -5992,6 +6176,7 @@ session_picker_view = "dense"
                 updated_at: Some(now - Duration::minutes(idx * 5)),
                 cwd: None,
                 git_branch: None,
+                is_side_conversation: false,
             })
             .collect();
         state.filtered_rows = state.all_rows.clone();
@@ -6044,6 +6229,7 @@ session_picker_view = "dense"
                 updated_at: Some(now - Duration::minutes(idx * 5)),
                 cwd: None,
                 git_branch: None,
+                is_side_conversation: false,
             })
             .collect();
         state.filtered_rows = state.all_rows.clone();
@@ -6611,6 +6797,7 @@ session_picker_view = "dense"
             updated_at: None,
             cwd: None,
             git_branch: None,
+            is_side_conversation: false,
         };
         state.all_rows = vec![row.clone()];
         state.filtered_rows = vec![row];
@@ -6650,6 +6837,7 @@ session_picker_view = "dense"
             updated_at: None,
             cwd: None,
             git_branch: None,
+            is_side_conversation: false,
         };
         state.all_rows = vec![row.clone()];
         state.filtered_rows = vec![row];
@@ -6708,6 +6896,20 @@ session_picker_view = "dense"
             turns: Vec::new(),
         };
 
+        for (source, expected_side) in [
+            (None, false),
+            (Some(ThreadSource::User), false),
+            (Some(ThreadSource::Feature("other_feature".into())), false),
+            (
+                Some(ThreadSource::Feature("side_conversation".into())),
+                true,
+            ),
+        ] {
+            let mut marked_thread = thread.clone();
+            marked_thread.thread_source = source;
+            let row = row_from_app_server_thread(marked_thread).expect("row should be preserved");
+            assert_eq!(row.is_side_conversation, expected_side);
+        }
         let row = row_from_app_server_thread(thread).expect("row should be preserved");
 
         assert_eq!(row.path, None);

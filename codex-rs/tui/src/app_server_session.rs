@@ -364,6 +364,7 @@ impl ThreadParamsMode {
 #[derive(Debug, Clone)]
 pub(crate) struct AppServerStartedThread {
     pub(crate) session: ThreadSessionState,
+    pub(crate) side_parent_thread_id: Option<ThreadId>,
     pub(crate) turns: Vec<Turn>,
     pub(crate) blocks_direct_input: bool,
     pub(crate) task_tools_available: bool,
@@ -887,10 +888,11 @@ impl AppServerSession {
     pub(crate) async fn fork_side_thread(
         &mut self,
         local_settings: &LocalSettings,
-        config: Config,
+        mut config: Config,
         thread_id: ThreadId,
         selected_profile: Option<&PermissionProfileSelection>,
     ) -> Result<AppServerStartedThread> {
+        config.ephemeral = false;
         self.fork_thread_at_with_presentation(
             local_settings,
             config,
@@ -954,6 +956,9 @@ impl AppServerSession {
                 self.remote_cwd_override.as_deref(),
             )
         };
+        if presentation == ForkPresentation::SideConversation {
+            params.thread_source = Some(ThreadSource::Feature("side_conversation".to_string()));
+        }
         params.model_provider = match config_source {
             ForkConfigSource::Local => self
                 .model_provider_override
@@ -2247,6 +2252,7 @@ async fn started_thread_from_start_response(
         session,
         turns: response.thread.turns,
         blocks_direct_input,
+        side_parent_thread_id: None,
         task_tools_available: false,
     })
 }
@@ -2266,8 +2272,16 @@ async fn started_thread_from_resume_response(
     )
     .await
     .map_err(color_eyre::eyre::Report::msg)?;
+    let side_parent_thread_id = matches!(
+        response.thread.thread_source,
+        Some(ThreadSource::Feature(ref source)) if source == "side_conversation"
+    )
+    .then_some(session.forked_from_id)
+    .flatten()
+    .filter(|parent_id| *parent_id != session.thread_id);
     Ok(AppServerStartedThread {
         session,
+        side_parent_thread_id,
         turns: response.thread.turns,
         blocks_direct_input,
         task_tools_available: false,
@@ -2293,6 +2307,7 @@ async fn started_thread_from_fork_response(
         session,
         turns: response.thread.turns,
         blocks_direct_input,
+        side_parent_thread_id: None,
         task_tools_available: false,
     })
 }

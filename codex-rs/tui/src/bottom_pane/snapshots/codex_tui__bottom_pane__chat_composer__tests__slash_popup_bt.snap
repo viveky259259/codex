@@ -2,7 +2,7 @@
 source: tui/src/bottom_pane/chat_composer.rs
 expression: terminal.backend()
 ---
-"› /btw  start a side conversation in an ephemeral fork      "
+"› /btw  start a side conversation (archived when closed)    "
 "                                                            "
 "› /bt                                                       "
 "                                                            "

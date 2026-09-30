@@ -257,6 +257,7 @@ mod server_version_notice;
 mod session_lifecycle;
 mod session_picker;
 mod side;
+mod side_resume;
 mod startup;
 mod startup_prompts;
 mod startup_warnings;

@@ -23,6 +23,7 @@ fn thread_colors_and_selection_contrast_in_both_picker_layouts() {
         updated_at: None,
         cwd: None,
         git_branch: None,
+        is_side_conversation: false,
     };
     let mut state = PickerState::new(
         FrameRequester::test_dummy(),
@@ -167,6 +168,7 @@ fn compact_picker_keeps_metadata_and_labeled_primary_actions() {
             updated_at: timestamp,
             cwd: Some(PathBuf::from("/tmp/codex")),
             git_branch: Some("fcoury/contrast".into()),
+            is_side_conversation: false,
         })
         .collect();
     let mut snapshots = Vec::new();
@@ -272,6 +274,7 @@ async fn narrow_toolbar_keeps_keyboard_focused_control_visible() {
                 SessionPickerAction::Resume => &[
                     ("Filter: Cwd", "Cwd"),
                     ("Status: Archived", "Archived"),
+                    ("Side chats: Hidden", "Hidden"),
                     ("Sort: Updated", "Updated"),
                 ],
                 SessionPickerAction::Fork => {

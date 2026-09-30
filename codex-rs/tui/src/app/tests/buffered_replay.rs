@@ -102,6 +102,7 @@ async fn refreshed_active_reasoning_accepts_later_deltas_and_complete_summary() 
                     session,
                     turns: vec![turn],
                     blocks_direct_input: false,
+                    side_parent_thread_id: None,
                     task_tools_available: false,
                 },
                 &mut snapshot,
