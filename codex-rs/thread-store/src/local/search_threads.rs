@@ -12,6 +12,7 @@ use codex_utils_absolute_path::normalize_windows_device_path;
 use super::LocalThreadStore;
 use super::helpers::resolve_thread_names;
 use super::helpers::resolve_thread_section_metadata;
+use super::helpers::resolve_thread_sources;
 use super::helpers::set_thread_name;
 use super::helpers::stored_thread_from_rollout_item;
 use super::list_threads::list_rollout_threads;
@@ -179,6 +180,14 @@ pub(super) async fn search_threads(
             })
         })
         .collect::<Vec<_>>();
+    let paths = items
+        .iter()
+        .map(|item| (item.thread.thread_id, item.thread.rollout_path.clone()))
+        .collect();
+    let mut sources = resolve_thread_sources(store, &paths).await;
+    for item in &mut items {
+        item.thread.thread_source = sources.remove(&item.thread.thread_id);
+    }
     if let Some(state_db) = state_db {
         let sectioned_thread_ids = items
             .iter()

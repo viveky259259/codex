@@ -19,10 +19,12 @@ use codex_protocol::protocol::NetworkAccess;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadSource;
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 use codex_rollout::RolloutReferenceIndex;
 use codex_rollout::ThreadItem;
 use codex_rollout::find_thread_names_by_ids;
+use codex_rollout::read_session_meta_line;
 use codex_state::ThreadMetadata;
 
 use super::LocalThreadStore;
@@ -236,6 +238,37 @@ pub(super) async fn resolve_thread_section_metadata(
         .get_thread_section_ordering(thread_ids)
         .await
         .unwrap_or_default()
+}
+
+pub(super) async fn resolve_thread_sources(
+    store: &LocalThreadStore,
+    paths: &HashMap<ThreadId, Option<PathBuf>>,
+) -> HashMap<ThreadId, ThreadSource> {
+    let metadata = if let Some(state_db) = store.state_db().await {
+        state_db
+            .get_threads(&paths.keys().copied().collect::<Vec<_>>())
+            .await
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let mut sources = HashMap::new();
+    for (&thread_id, path) in paths {
+        let source = if let Some(metadata) = metadata.get(&thread_id) {
+            metadata.thread_source.clone()
+        } else if let Some(path) = path
+            && let Ok(meta) = read_session_meta_line(path).await
+            && meta.meta.id == thread_id
+        {
+            meta.meta.thread_source
+        } else {
+            None
+        };
+        if let Some(source) = source {
+            sources.insert(thread_id, source);
+        }
+    }
+    sources
 }
 
 pub(super) async fn resolve_thread_names(

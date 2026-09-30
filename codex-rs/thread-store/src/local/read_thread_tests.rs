@@ -20,6 +20,91 @@ use crate::ReadThreadParams;
 use crate::ThreadStore;
 
 #[tokio::test]
+async fn archived_side_sources_survive_nonempty_legacy_reads_and_listing()
+-> Result<(), Box<dyn std::error::Error>> {
+    for with_sqlite in [false, true] {
+        let home = TempDir::new()?;
+        let config = test_config(home.path());
+        let state_db = if with_sqlite {
+            Some(
+                codex_state::StateRuntime::init(
+                    config.sqlite.clone(),
+                    config.default_model_provider_id.clone(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let store = LocalThreadStore::new(config, state_db);
+        let uuid = uuid::Uuid::new_v4();
+        let thread_id = ThreadId::from_string(&uuid.to_string())?;
+        let path = super::test_support::write_archived_session_file(
+            home.path(),
+            "2025-01-03T12-00-00",
+            uuid,
+        )?;
+        let contents = fs::read_to_string(&path)?;
+        let (header, history) = contents.split_once('\n').expect("rollout header");
+        let mut header: serde_json::Value = serde_json::from_str(header)?;
+        header["payload"]["thread_source"] = serde_json::json!("side_conversation");
+        fs::write(&path, format!("{header}\n{history}"))?;
+        let expected_source = Some(ThreadSource::Feature("side_conversation".into()));
+
+        let read = store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await?;
+        assert_eq!(read.thread_source, expected_source);
+
+        let params = crate::ListThreadsParams {
+            page_size: 10,
+            cursor: None,
+            sort_key: crate::ThreadSortKey::CreatedAt,
+            sort_direction: crate::SortDirection::Desc,
+            allowed_sources: Vec::new(),
+            model_providers: None,
+            cwd_filters: None,
+            section: None,
+            project_id: None,
+            archived: true,
+            search_term: None,
+            relation_filter: None,
+            use_state_db_only: false,
+        };
+        let listed = store.list_threads(params.clone()).await?;
+        assert_eq!(listed.items.len(), 1);
+        assert_eq!(listed.items[0].thread_source, expected_source);
+        if with_sqlite {
+            let listed = store
+                .list_threads(crate::ListThreadsParams {
+                    use_state_db_only: true,
+                    ..params
+                })
+                .await?;
+            assert_eq!(listed.items[0].thread_source, expected_source);
+        }
+        let searched = store
+            .search_threads(crate::SearchThreadsParams {
+                page_size: 10,
+                cursor: None,
+                sort_key: crate::ThreadSortKey::CreatedAt,
+                sort_direction: crate::SortDirection::Desc,
+                allowed_sources: Vec::new(),
+                archived: true,
+                search_term: "Archived user message".into(),
+            })
+            .await?;
+        assert_eq!(searched.items.len(), 1);
+        assert_eq!(searched.items[0].thread.thread_source, expected_source);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn empty_archived_reads_without_sqlite_preserve_source_and_file_time()
 -> Result<(), Box<dyn std::error::Error>> {
     let home = TempDir::new()?;

@@ -10,6 +10,7 @@ use codex_state::ThreadFilterOptions;
 use super::LocalThreadStore;
 use super::helpers::resolve_thread_names;
 use super::helpers::resolve_thread_section_metadata;
+use super::helpers::resolve_thread_sources;
 use super::helpers::set_thread_name;
 use super::helpers::stored_thread_from_rollout_item;
 use super::read_thread::stored_thread_from_state_metadata;
@@ -88,7 +89,13 @@ pub(super) async fn list_threads(
         .map(|thread| (thread.thread_id, thread.history_mode))
         .collect::<HashMap<_, _>>();
     let names = resolve_thread_names(store, &thread_history_modes).await;
+    let paths = items
+        .iter()
+        .map(|thread| (thread.thread_id, thread.rollout_path.clone()))
+        .collect();
+    let mut sources = resolve_thread_sources(store, &paths).await;
     for thread in &mut items {
+        thread.thread_source = sources.remove(&thread.thread_id);
         if let Some(name) = names.get(&thread.thread_id).cloned() {
             set_thread_name(thread, name);
         }
