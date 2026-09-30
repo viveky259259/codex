@@ -76,6 +76,10 @@ use uuid::Uuid;
 mod archive;
 mod layout;
 mod page_loading;
+mod side_chats;
+
+use side_chats::ToolbarControl;
+use side_chats::side_chats_control_spans;
 
 #[cfg(test)]
 #[path = "resume_picker_color_tests.rs"]
@@ -230,46 +234,6 @@ impl SessionFilterMode {
 enum SessionStatus {
     Active,
     Archived,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ToolbarControl {
-    Filter,
-    Status,
-    SideChats,
-    Sort,
-}
-
-impl ToolbarControl {
-    fn previous(self, action: SessionPickerAction, status: SessionStatus) -> Self {
-        match self {
-            Self::Filter => Self::Sort,
-            Self::Status => Self::Filter,
-            Self::SideChats => Self::Status,
-            Self::Sort
-                if matches!(action, SessionPickerAction::Resume)
-                    && status == SessionStatus::Archived =>
-            {
-                Self::SideChats
-            }
-            Self::Sort if matches!(action, SessionPickerAction::Resume) => Self::Status,
-            Self::Sort => Self::Filter,
-        }
-    }
-
-    fn next(self, action: SessionPickerAction, status: SessionStatus) -> Self {
-        match self {
-            Self::Filter if matches!(action, SessionPickerAction::Resume) => Self::Status,
-            Self::Status
-                if matches!(action, SessionPickerAction::Resume)
-                    && status == SessionStatus::Archived =>
-            {
-                Self::SideChats
-            }
-            Self::Filter | Self::Status | Self::SideChats => Self::Sort,
-            Self::Sort => Self::Filter,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2258,24 +2222,6 @@ fn toolbar_line(state: &PickerState, compact: bool) -> Line<'static> {
     spans.into()
 }
 
-fn side_chats_control_spans(state: &PickerState, compact: bool) -> Vec<Span<'static>> {
-    let focused = state.toolbar_focus == ToolbarControl::SideChats;
-    let value = if state.show_side_conversations {
-        "Shown"
-    } else {
-        "Hidden"
-    };
-    let label = if compact {
-        "Side chats:"
-    } else {
-        "Side chats: "
-    };
-    vec![
-        label.set_style(secondary_text_style()),
-        toolbar_value(value, /*active*/ true, focused),
-    ]
-}
-
 fn sort_control_spans(state: &PickerState, compact: bool) -> Vec<Span<'static>> {
     let sort_focused = state.toolbar_focus == ToolbarControl::Sort;
     if compact {
@@ -3659,7 +3605,7 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
 
-    fn page(
+    pub(super) fn page(
         rows: Vec<Row>,
         next_cursor: Option<&str>,
         num_scanned_files: usize,
@@ -3674,7 +3620,9 @@ mod tests {
         }
     }
 
-    fn page_only_loader(loader: impl Fn(PageLoadRequest) + Send + Sync + 'static) -> PickerLoader {
+    pub(super) fn page_only_loader(
+        loader: impl Fn(PageLoadRequest) + Send + Sync + 'static,
+    ) -> PickerLoader {
         Arc::new(move |request| {
             if let PickerLoadRequest::Page(request) = request {
                 loader(request);
@@ -3702,7 +3650,7 @@ mod tests {
         Ok(page(rows, next_cursor, n, /*reached_scan_cap*/ false))
     }
 
-    fn make_row(path: &str, ts: &str, preview: &str) -> Row {
+    pub(super) fn make_row(path: &str, ts: &str, preview: &str) -> Row {
         let timestamp = parse_timestamp_str(ts).expect("timestamp should parse");
         Row {
             path: Some(PathBuf::from(path)),
@@ -3717,7 +3665,7 @@ mod tests {
         }
     }
 
-    fn local_db_first_state() -> (PickerState, Arc<Mutex<Vec<PageLoadRequest>>>) {
+    pub(super) fn local_db_first_state() -> (PickerState, Arc<Mutex<Vec<PageLoadRequest>>>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let request_sink = Arc::clone(&requests);
         let loader = page_only_loader(move |request| {
@@ -4523,97 +4471,6 @@ mod tests {
         };
 
         assert!(state.row_matches_filter(&row));
-    }
-
-    #[test]
-    fn archived_picker_hides_side_conversations_by_default_and_can_show_them() {
-        let loader = page_only_loader(|_| {});
-        let mut state = PickerState::new(
-            FrameRequester::test_dummy(),
-            loader,
-            ProviderFilter::Any,
-            /*show_all*/ true,
-            /*filter_cwd*/ None,
-            SessionPickerAction::Resume,
-        );
-        state.status = SessionStatus::Archived;
-        let mut side_row = make_row("/side.jsonl", "2025-01-01T00:00:00Z", "side chat");
-        side_row.is_side_conversation = true;
-        let regular_row = make_row("/main.jsonl", "2025-01-01T00:00:00Z", "main chat");
-
-        assert!(!state.row_matches_filter(&side_row));
-        assert!(state.row_matches_filter(&regular_row));
-
-        state.toolbar_focus = ToolbarControl::SideChats;
-        state.change_focused_toolbar_value();
-        assert!(state.row_matches_filter(&side_row));
-
-        let mut snapshots = Vec::new();
-        for density in [SessionListDensity::Comfortable, SessionListDensity::Dense] {
-            state.density = density;
-            state.relative_time_reference = parse_timestamp_str("2025-01-02T00:00:00Z");
-            let rows = render_session_lines(
-                &side_row, &state, /*is_selected*/ true, /*is_expanded*/ false,
-                /*is_zebra*/ false, /*width*/ 80,
-            )
-            .into_iter()
-            .map(|line| line.to_string().trim_end().to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-            snapshots.push(format!(
-                "{density:?}\n{}\n{rows}",
-                toolbar_line(&state, false)
-            ));
-        }
-        assert_snapshot!(snapshots.join("\n\n"));
-    }
-
-    #[test]
-    fn archived_toolbar_cycles_through_side_chat_filter_in_both_directions() {
-        let controls = [
-            ToolbarControl::Filter,
-            ToolbarControl::Status,
-            ToolbarControl::SideChats,
-            ToolbarControl::Sort,
-        ];
-        for (index, control) in controls.into_iter().enumerate() {
-            assert_eq!(
-                control.next(SessionPickerAction::Resume, SessionStatus::Archived),
-                controls[(index + 1) % controls.len()]
-            );
-            assert_eq!(
-                control.previous(SessionPickerAction::Resume, SessionStatus::Archived),
-                controls[(index + controls.len() - 1) % controls.len()]
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn archived_picker_loads_past_a_page_containing_only_hidden_side_chats() {
-        let (mut state, requests) = local_db_first_state();
-        state.status = SessionStatus::Archived;
-        state.start_initial_load();
-        let token = state.next_request_token - 1;
-        let mut side_row = make_row("/side.jsonl", "2025-01-01T00:00:00Z", "side chat");
-        side_row.is_side_conversation = true;
-        state
-            .handle_background_event(BackgroundEvent::Page {
-                request_token: token,
-                search_token: None,
-                page: Ok(page(
-                    vec![side_row],
-                    Some("next"),
-                    /*num_scanned_files*/ 1,
-                    /*reached_scan_cap*/ false,
-                )),
-            })
-            .await
-            .unwrap();
-        assert!(state.filtered_rows.is_empty());
-        assert_eq!(requests.lock().unwrap().len(), 2);
-        assert!(
-            matches!(&requests.lock().unwrap()[1].cursor, Some(PageCursor::AppServer(cursor)) if cursor == "next")
-        );
     }
 
     #[test]

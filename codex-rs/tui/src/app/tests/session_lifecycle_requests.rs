@@ -792,6 +792,53 @@ async fn side_conversation_survives_restart_and_can_be_restored_after_close() ->
             .await?;
         assert_eq!(app.active_side_parent_thread_id(), Some(parent_id));
         assert!(app.chat_widget.side_conversation_active());
+        // Reopening in this same App must route a fresh turn, reply, and approval again.
+        let notifications = [
+            turn_started_notification(side_id, "reopened-turn"),
+            agent_message_delta_notification(side_id, "reopened-turn", "reply", "new reply"),
+            turn_completed_notification(side_id, "reopened-turn", TurnStatus::Completed),
+        ];
+        for notification in notifications {
+            app.handle_app_server_event(
+                &server,
+                AppServerEvent::ServerNotification(Box::new(notification.clone())),
+            )
+            .await;
+            let ThreadBufferedEvent::Notification(received) = app
+                .active_thread_rx
+                .as_mut()
+                .expect("active side chat")
+                .try_recv()
+                .expect("reopened side chat must receive live notifications")
+            else {
+                panic!("expected a live notification");
+            };
+            assert_eq!(
+                serde_json::to_value(received.as_ref())?,
+                serde_json::to_value(notification)?
+            );
+            app.handle_thread_event_now_recovering_file_changes(ThreadBufferedEvent::Notification(
+                received,
+            ))
+            .await;
+        }
+        let approval = exec_approval_request(side_id, "reopened-turn", "command", Some("approval"));
+        app.handle_app_server_event(
+            &server,
+            AppServerEvent::ServerRequest(Box::new(approval.clone())),
+        )
+        .await;
+        assert!(
+            app.pending_app_server_requests
+                .contains_server_request(&approval)
+        );
+        assert!(
+            app.thread_event_channels[&side_id]
+                .store
+                .lock()
+                .await
+                .has_pending_thread_approvals()
+        );
         app.shutdown_current_thread(&mut server).await;
         let archived = server
             .thread_list(serde_json::from_value(

@@ -9,6 +9,9 @@ impl App {
         app_server: &mut AppServerSession,
         started: AppServerStartedThread,
     ) -> Result<()> {
+        // The resume RPC succeeded, so this attachment can receive live events again.
+        self.abandoned_side_threads
+            .remove(&started.session.thread_id);
         let Some(parent_thread_id) = started.side_parent_thread_id else {
             return self
                 .replace_chat_widget_with_app_server_thread(
