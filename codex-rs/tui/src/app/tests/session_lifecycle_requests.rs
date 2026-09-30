@@ -524,7 +524,10 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                             inventories += usize::from(inventories > 0);
                             matches!(inventories, 2 | 4)
                         };
-                        let detach = request.method == "thread/unsubscribe";
+                        let detach = matches!(
+                            request.method.as_str(),
+                            "thread/unsubscribe" | "thread/archive"
+                        );
                         let request = serde_json::from_value::<ClientRequest>(
                             serde_json::to_value(request)?,
                         )?;
@@ -675,6 +678,237 @@ async fn make_history_test_app() -> Result<(Box<App>, tempfile::TempDir)> {
 }
 
 #[tokio::test]
+async fn side_conversation_survives_restart_and_can_be_restored_after_close() -> Result<()> {
+    for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+        let (mut app, _codex_home) = make_history_test_app().await?;
+        app.local_settings = crate::local_settings::LocalSettings::from(&app.config);
+        app.harness_overrides.cwd = Some(app.config.cwd.to_path_buf());
+        crate::legacy_core::config::set_project_trust_level(
+            app.config.codex_home.as_path(),
+            app.config.cwd.as_path(),
+            codex_protocol::config_types::TrustLevel::Trusted,
+        )
+        .map_err(std::io::Error::other)?;
+        let parent_id = create_history_rollout(&app.config, history_mode, "saved parent history")?;
+        let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+        let side = server
+            .fork_side_thread(
+                &app.local_settings,
+                app.config.clone(),
+                parent_id,
+                /*selected_profile*/ None,
+            )
+            .await?;
+        let side_id = side.session.thread_id;
+        assert!(side.session.rollout_path.is_some());
+        server.shutdown().await?;
+
+        let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+        let saved = server.thread_read(side_id, /*include_turns*/ false).await?;
+        assert_eq!(saved.forked_from_id, Some(parent_id.to_string()));
+        assert_eq!(
+            saved.thread_source,
+            Some(codex_app_server_protocol::ThreadSource::Feature(
+                "side_conversation".into()
+            ))
+        );
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        let target = crate::resume_picker::SessionTarget {
+            path: saved.path.clone(),
+            thread_id: side_id,
+            cwd: None,
+            history_mode: Some(history_mode),
+        };
+        app.resume_target_session(&mut tui, &mut server, target.clone())
+            .await?;
+        assert_eq!(app.chat_widget.thread_id(), Some(side_id));
+        assert_eq!(app.primary_thread_id, Some(parent_id));
+        assert_eq!(app.active_side_parent_thread_id(), Some(parent_id));
+        assert!(app.chat_widget.side_conversation_active());
+        app.toggle_side_conversation(&mut tui, &mut server).await?;
+        assert_eq!(app.chat_widget.thread_id(), Some(parent_id));
+        app.resume_target_session(&mut tui, &mut server, target)
+            .await?;
+        assert_eq!(app.chat_widget.thread_id(), Some(side_id));
+        // Picking an already-open side chat must not archive the resumed destination.
+        let loaded = server
+            .thread_loaded_list(ThreadLoadedListParams {
+                cursor: None,
+                limit: None,
+            })
+            .await?;
+        assert!(loaded.data.contains(&side_id.to_string()));
+        assert!(app.maybe_return_from_side(&mut tui, &mut server).await);
+        assert_eq!(app.chat_widget.thread_id(), Some(parent_id));
+        // Ctrl+C archives in the background after the parent becomes visible.
+        tokio::time::timeout(Duration::from_secs(/*secs*/ 10), async {
+            loop {
+                let archived = server
+                    .thread_list(serde_json::from_value(
+                        serde_json::json!({"archived": true}),
+                    )?)
+                    .await?;
+                if archived
+                    .data
+                    .iter()
+                    .any(|thread| thread.id == side_id.to_string())
+                {
+                    return Ok::<_, color_eyre::Report>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        server.shutdown().await?;
+
+        let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+        for use_state_db_only in [true, false] {
+            let archived = server
+                .thread_list(serde_json::from_value(serde_json::json!({
+                    "archived": true,
+                    "useStateDbOnly": use_state_db_only,
+                }))?)
+                .await?;
+            let side = archived
+                .data
+                .iter()
+                .find(|thread| thread.id == side_id.to_string())
+                .expect("archived side conversation");
+            assert_eq!(side.thread_source, saved.thread_source);
+        }
+        let restored = server.thread_unarchive(side_id).await?;
+        assert_eq!(restored.id, side_id.to_string());
+        assert_eq!(restored.thread_source, saved.thread_source);
+        let resumed = server
+            .resume_thread(
+                &app.local_settings,
+                app.config.clone(),
+                side_id,
+                crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+            )
+            .await?;
+        // Startup uses the same attachment path after its initial resume RPC.
+        app.attach_resumed_thread(&mut tui, &mut server, resumed)
+            .await?;
+        assert_eq!(app.active_side_parent_thread_id(), Some(parent_id));
+        assert!(app.chat_widget.side_conversation_active());
+        // Reopening in this same App must route a fresh turn, reply, and approval again.
+        let notifications = [
+            turn_started_notification(side_id, "reopened-turn"),
+            agent_message_delta_notification(side_id, "reopened-turn", "reply", "new reply"),
+            turn_completed_notification(side_id, "reopened-turn", TurnStatus::Completed),
+        ];
+        for notification in notifications {
+            app.handle_app_server_event(
+                &server,
+                AppServerEvent::ServerNotification(Box::new(notification.clone())),
+            )
+            .await;
+            let ThreadBufferedEvent::Notification(received) = app
+                .active_thread_rx
+                .as_mut()
+                .expect("active side chat")
+                .try_recv()
+                .expect("reopened side chat must receive live notifications")
+            else {
+                panic!("expected a live notification");
+            };
+            assert_eq!(
+                serde_json::to_value(received.as_ref())?,
+                serde_json::to_value(notification)?
+            );
+            app.handle_thread_event_now_recovering_file_changes(ThreadBufferedEvent::Notification(
+                received,
+            ))
+            .await;
+        }
+        let approval = exec_approval_request(side_id, "reopened-turn", "command", Some("approval"));
+        app.handle_app_server_event(
+            &server,
+            AppServerEvent::ServerRequest(Box::new(approval.clone())),
+        )
+        .await;
+        assert!(
+            app.pending_app_server_requests
+                .contains_server_request(&approval)
+        );
+        assert!(
+            app.thread_event_channels[&side_id]
+                .store
+                .lock()
+                .await
+                .has_pending_thread_approvals()
+        );
+        app.shutdown_current_thread(&mut server).await;
+        let archived = server
+            .thread_list(serde_json::from_value(
+                serde_json::json!({"archived": true}),
+            )?)
+            .await?;
+        assert!(
+            archived
+                .data
+                .iter()
+                .any(|thread| thread.id == side_id.to_string())
+        );
+        server.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn restored_side_conversation_is_archived_even_when_parent_is_missing() -> Result<()> {
+    let (mut app, _codex_home) = make_history_test_app().await?;
+    let parent_id =
+        create_history_rollout(&app.config, ThreadHistoryMode::Legacy, "parent history")?;
+    let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    let parent_path = server
+        .thread_read(parent_id, /*include_turns*/ false)
+        .await?
+        .path
+        .expect("parent rollout");
+    let side = server
+        .fork_side_thread(
+            &app.local_settings,
+            app.config.clone(),
+            parent_id,
+            /*selected_profile*/ None,
+        )
+        .await?;
+    let side_id = side.session.thread_id;
+    server.shutdown().await?;
+    std::fs::remove_file(parent_path)?;
+    let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    let resumed = server
+        .resume_thread(
+            &app.local_settings,
+            app.config.clone(),
+            side_id,
+            crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+        )
+        .await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.attach_resumed_thread(&mut tui, &mut server, resumed)
+        .await?;
+    assert_eq!(app.chat_widget.thread_id(), Some(side_id));
+    assert!(app.chat_widget.side_conversation_active());
+    app.shutdown_current_thread(&mut server).await;
+    let archived = server
+        .thread_list(serde_json::from_value(
+            serde_json::json!({"archived": true}),
+        )?)
+        .await?;
+    assert!(
+        archived
+            .data
+            .iter()
+            .any(|thread| thread.id == side_id.to_string())
+    );
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn delete_current_thread_navigates_only_after_success() -> Result<()> {
     let endpoint = crate::resolve_remote_addr("ws://127.0.0.1:4500")?;
     for target in [
@@ -736,7 +970,7 @@ async fn delete_current_thread_navigates_only_after_success() -> Result<()> {
         app.side_threads
             .insert(side_id, SideThreadState::new(thread_id));
         if !matches!(app.app_server_target, AppServerTarget::Embedded) {
-            // The recording proxy rejects the next unsubscribe after a failed fork.
+            // The recording proxy rejects the next side archive after a failed fork.
             side_config.cwd = side_config.cwd.join("failure");
             assert!(
                 server
@@ -776,7 +1010,7 @@ async fn delete_current_thread_navigates_only_after_success() -> Result<()> {
             assert_matches!(control, AppRunControl::Continue);
             assert!(app.side_threads.is_empty());
             assert_eq!(
-                recorded_params(&requests, "thread/unsubscribe"),
+                recorded_params(&requests, "thread/archive"),
                 vec![serde_json::json!({"threadId": side_id.to_string()}); 2]
             );
             loop {
@@ -1069,14 +1303,14 @@ async fn archive_current_thread_returns_shared_servers_to_agents() -> Result<()>
         assert!(!app.agents_overview.threads.contains_key(&thread_id));
         assert!(app.thread_event_channels.is_empty());
         assert!(app.side_threads.is_empty());
-        assert_eq!(
-            recorded_params(&requests, "thread/unsubscribe"),
-            vec![serde_json::json!({"threadId": side_id.to_string()})]
-        );
+        assert!(recorded_params(&requests, "thread/unsubscribe").is_empty());
         assert!(app.chat_widget.composer_is_empty());
         assert_eq!(
             recorded_params(&requests, "thread/archive"),
-            vec![serde_json::json!({"threadId": thread_id.to_string()})]
+            vec![
+                serde_json::json!({"threadId": side_id.to_string()}),
+                serde_json::json!({"threadId": thread_id.to_string()}),
+            ]
         );
         assert!(
             app.chat_widget
@@ -2840,6 +3074,10 @@ async fn paginated_workflows_never_request_full_thread_history() -> Result<()> {
         /*selected_profile*/ None,
     ))
     .await?;
+    let fork_requests = recorded_params(&requests, "thread/fork");
+    let side_fork = fork_requests.last().expect("side fork request");
+    assert!(!side_fork["ephemeral"].as_bool().unwrap_or(false));
+    assert_eq!(side_fork["threadSource"], "side_conversation");
 
     let paginated_reads = recorded_params(&requests, "thread/read");
     assert!(!paginated_reads.is_empty());

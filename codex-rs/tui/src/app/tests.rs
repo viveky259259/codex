@@ -633,6 +633,7 @@ async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach()
             session: test_thread_session(ThreadId::new(), app.config.cwd.to_path_buf()),
             turns: Vec::new(),
             blocks_direct_input: false,
+            side_parent_thread_id: None,
             task_tools_available: false,
         },
         session_lifecycle::ThreadAttachPresentation::SessionLineage,
@@ -4883,14 +4884,14 @@ fn agent_picker_item_name_snapshot() {
 }
 
 #[tokio::test]
-async fn side_fork_config_is_ephemeral_and_appends_developer_guardrails() {
+async fn side_fork_config_is_persistent_and_appends_developer_guardrails() {
     let app = make_test_app().await;
     let original_approval_policy = app.config.permissions.approval_policy.value();
     let original_sandbox_policy = app.config.legacy_sandbox_policy();
 
     let fork_config = app.side_fork_config();
 
-    assert!(fork_config.ephemeral);
+    assert!(!fork_config.ephemeral);
     assert_eq!(
         fork_config.permissions.approval_policy.value(),
         original_approval_policy
@@ -5401,6 +5402,7 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
             session: test_thread_session(child_thread_id, test_path_buf("/tmp/child")),
             turns: Vec::new(),
             blocks_direct_input: false,
+            side_parent_thread_id: None,
             task_tools_available: false,
         },
         &mut child_snapshot,
@@ -5603,7 +5605,7 @@ async fn discard_side_thread_removes_agent_navigation_entry() -> Result<()> {
         let mut app_server =
             crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
         let mut side_config = app.chat_widget.config_ref().clone();
-        side_config.ephemeral = true;
+        side_config.ephemeral = false;
         let started = app_server.start_thread(&side_config).await?;
         let side_thread_id = started.session.thread_id;
         app.side_threads
@@ -6561,6 +6563,7 @@ async fn app_server_thread_replacement_clears_previous_transcript_before_replay(
                 }],
             )],
             blocks_direct_input: false,
+            side_parent_thread_id: None,
             task_tools_available: false,
         },
         session_lifecycle::ThreadAttachPresentation::SessionLineage,
@@ -8926,6 +8929,7 @@ async fn refreshed_snapshot_session_persists_resumed_turns() {
             session: resumed_session.clone(),
             turns: resumed_turns.clone(),
             blocks_direct_input: true,
+            side_parent_thread_id: None,
             task_tools_available: false,
         },
         &mut snapshot,

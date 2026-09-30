@@ -1305,6 +1305,11 @@ impl App {
         if self.reject_pending_permission_root_switch() {
             return Ok(AppRunControl::Continue);
         }
+        if self.side_threads.contains_key(&target_session.thread_id) {
+            self.select_agent_thread(tui, app_server, target_session.thread_id)
+                .await?;
+            return Ok(AppRunControl::Continue);
+        }
         let (mut resume_config, local_settings) = match self
             .resume_config_for_target(tui, app_server, &target_session)
             .await
@@ -1375,15 +1380,7 @@ impl App {
         );
         self.file_search
             .update_search_dir(self.config.cwd.to_path_buf());
-        match self
-            .replace_chat_widget_with_app_server_thread(
-                tui,
-                resumed,
-                ThreadAttachPresentation::SessionLineage,
-                /*initial_user_message*/ None,
-            )
-            .await
-        {
+        match self.attach_resumed_thread(tui, app_server, resumed).await {
             Ok(()) => {
                 if let Some(input) = retained_input {
                     self.chat_widget.restore_thread_input_state(

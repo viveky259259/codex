@@ -102,6 +102,7 @@ impl AppServerSession {
                 session,
                 turns: thread.turns,
                 blocks_direct_input: false,
+                side_parent_thread_id: None,
                 task_tools_available: false,
             },
             history_notice,
